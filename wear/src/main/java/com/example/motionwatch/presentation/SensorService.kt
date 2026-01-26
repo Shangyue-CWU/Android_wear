@@ -1,6 +1,9 @@
 package com.example.motionwatch.presentation
 
-import android.app.*
+import android.annotation.SuppressLint
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.hardware.Sensor
@@ -11,204 +14,296 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.example.motionwatch.R
 import com.google.android.gms.wearable.Wearable
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 class SensorService : Service(), SensorEventListener {
 
     private lateinit var sensorManager: SensorManager
+    private var accSensor: Sensor? = null
+    private var gyroSensor: Sensor? = null
+
     private var accWriter: BufferedWriter? = null
     private var gyroWriter: BufferedWriter? = null
 
-    private val CHANNEL_ID = "sensor_logging_channel"
-    private val NOTIF_ID = 101
+    private val channelId = "sensor_logging_channel"
+    private val notifId = 101
 
-    // sport category received from MainActivity
+    // received from MainActivity
     private var sportCategory: String = "UNKNOWN"
+
+    // per-run session id (used for syncing + filenames)
+    private var sessionId: String = ""
+
+    // log folder
+    private lateinit var logsDir: File
+
+    // flush every N samples to reduce data loss
+    private val flushEvery = 50
+    private var accLinesSinceFlush = 0
+    private var gyroLinesSinceFlush = 0
+
+    // simple counters for debugging
+    private val accCount = AtomicLong(0)
+    private val gyroCount = AtomicLong(0)
+
+    // ✅ IMPORTANT: safe explicit sampling period to avoid 0us (FASTEST) crash
+    // 10,000 us = 10 ms ≈ 100 Hz
+    private val samplingPeriodUs = 10_000
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        Log.d("SensorService", "Service created")
+        Log.d(TAG, "onCreate()")
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
-        // Create log folder in internal storage
-        val folder = File(filesDir, "motion_logs")
-        if (!folder.exists()) folder.mkdirs()
-
-        // Auto-sync any old unsent files (optional)
-        folder.listFiles()?.forEach { file ->
-            sendFileToPhone(file)
-        }
+        logsDir = File(filesDir, "motion_logs")
+        if (!logsDir.exists()) logsDir.mkdirs()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d("SensorService", "Service started")
+        Log.d(TAG, "onStartCommand()")
 
-        // -----------------------------------------------
-        // NEW: Read the sport category from the intent
-        // -----------------------------------------------
+        // Read category (label)
         sportCategory = intent?.getStringExtra("sport") ?: "UNKNOWN"
-        Log.d("SensorService", "Sport category = $sportCategory")
 
-        // initialize writers now that we know category
-        initializeWriters()
+        // Create a fresh session id per start
+        sessionId = intent?.getStringExtra("sessionId")
+            ?: UUID.randomUUID().toString().replace("-", "").take(12)
 
-        startForegroundService()
+//        sessionId = UUID.randomUUID().toString().replace("-", "").take(12)
+
+        // 1) START FOREGROUND IMMEDIATELY (critical on Wear/Android 12+)
+        startInForeground(sportCategory, sessionId)
+
+        // 2) Now do file I/O
+        try {
+            initializeWriters(sportCategory, sessionId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize writers", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // 3) Now register sensors (uses safe samplingPeriodUs)
         registerSensors()
 
+        Log.d(TAG, "Logging started. sport=$sportCategory session=$sessionId")
         return START_STICKY
     }
 
-    // ---------------------------------------------------------
-    // NEW: Create CSV files with sport category in filename
-    // ---------------------------------------------------------
-    private fun initializeWriters() {
-        val folder = File(filesDir, "motion_logs")
-        if (!folder.exists()) folder.mkdirs()
+    // ----------------------------
+    // Foreground notification
+    // ----------------------------
+    @SuppressLint("ForegroundServiceType")
+    private fun startInForeground(sport: String, session: String) {
+        createNotificationChannelIfNeeded()
 
-        val timestamp = System.currentTimeMillis()
+        val notif = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("MotionWatch")
+            .setContentText("Logging… ($sport)  [$session]")
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
 
-        // ACC file
-        val accFile = File(folder, "${sportCategory}_ACC_${timestamp}.csv")
-        accWriter = BufferedWriter(FileWriter(accFile))
-        accWriter?.write("timestamp,ax,ay,az\n")
-
-        // GYRO file
-        val gyroFile = File(folder, "${sportCategory}_GYRO_${timestamp}.csv")
-        gyroWriter = BufferedWriter(FileWriter(gyroFile))
-        gyroWriter?.write("timestamp,gx,gy,gz\n")
-
-        Log.d("SensorService", "Created files: ${accFile.name}, ${gyroFile.name}")
+        startForeground(notifId, notif)
     }
 
-    // ------------------------------------------------------------
-    // SENSOR LOGGING
-    // ------------------------------------------------------------
+    private fun createNotificationChannelIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(NotificationManager::class.java)
+            val ch = NotificationChannel(
+                channelId,
+                "Motion Logging",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            nm.createNotificationChannel(ch)
+        }
+    }
+
+    // ----------------------------
+    // CSV writers
+    // ----------------------------
+    private fun initializeWriters(label: String, session: String) {
+        val ts = System.currentTimeMillis()
+        val safeLabel = label.replace(Regex("[^A-Za-z0-9_-]"), "_")
+
+        val accFile = File(logsDir, "SESSION_${session}_WATCH_${safeLabel}_ACC_${ts}.csv")
+        val gyroFile = File(logsDir, "SESSION_${session}_WATCH_${safeLabel}_GYRO_${ts}.csv")
+
+        accWriter = BufferedWriter(FileWriter(accFile, false)).apply {
+            write("# epoch_ms,ax,ay,az,label,session\n")
+            flush()
+        }
+        gyroWriter = BufferedWriter(FileWriter(gyroFile, false)).apply {
+            write("# epoch_ms,gx,gy,gz,label,session\n")
+            flush()
+        }
+
+        Log.d(TAG, "Created files: ${accFile.name}, ${gyroFile.name}")
+    }
+
+    // ----------------------------
+    // Sensor registration
+    // ----------------------------
     private fun registerSensors() {
-        val acc = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        // ✅ Avoid SENSOR_DELAY_FASTEST to prevent "0 microseconds" permission crash
+        Log.d(TAG, "Registering sensors @ ${samplingPeriodUs}us (~${1000000.0 / samplingPeriodUs} Hz)")
 
-        acc?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
-            Log.d("SensorService", "Accelerometer registered")
+        if (accSensor == null) {
+            Log.e(TAG, "Accelerometer not available on this watch")
+        } else {
+            sensorManager.registerListener(this, accSensor, samplingPeriodUs)
+            Log.d(TAG, "Accelerometer registered")
         }
 
-        gyro?.let {
-            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST)
-            Log.d("SensorService", "Gyroscope registered")
+        if (gyroSensor == null) {
+            Log.e(TAG, "Gyroscope not available on this watch")
+        } else {
+            sensorManager.registerListener(this, gyroSensor, samplingPeriodUs)
+            Log.d(TAG, "Gyroscope registered")
         }
     }
 
+    // ----------------------------
+    // Sensor callback
+    // ----------------------------
     override fun onSensorChanged(event: SensorEvent) {
         val t = System.currentTimeMillis()
 
         when (event.sensor.type) {
-
             Sensor.TYPE_ACCELEROMETER -> {
-                accWriter?.write("$t, ${event.values[0]}, ${event.values[1]}, ${event.values[2]}\n")
+                val w = accWriter ?: return
+                try {
+                    w.write("$t,${event.values[0]},${event.values[1]},${event.values[2]},$sportCategory,$sessionId\n")
+                    accLinesSinceFlush++
+                    accCount.incrementAndGet()
+                    if (accLinesSinceFlush >= flushEvery) {
+                        w.flush()
+                        accLinesSinceFlush = 0
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "ACC write failed", e)
+                }
             }
 
             Sensor.TYPE_GYROSCOPE -> {
-                gyroWriter?.write("$t, ${event.values[0]}, ${event.values[1]}, ${event.values[2]}\n")
+                val w = gyroWriter ?: return
+                try {
+                    val gx = event.values[0]
+                    val gy = event.values[1]
+                    val gz = event.values[2]
 
-                // Live UI update
-                val intent = Intent("GYRO_UPDATE")
-                intent.putExtra("gx", event.values[0])
-                intent.putExtra("gy", event.values[1])
-                intent.putExtra("gz", event.values[2])
-                sendBroadcast(intent)
+                    w.write("$t,$gx,$gy,$gz,$sportCategory,$sessionId\n")
+                    gyroLinesSinceFlush++
+                    gyroCount.incrementAndGet()
+                    if (gyroLinesSinceFlush >= flushEvery) {
+                        w.flush()
+                        gyroLinesSinceFlush = 0
+                    }
+
+                    // Live UI update (MainActivity listens for this)
+                    val ui = Intent(ACTION_GYRO_UPDATE).apply {
+                        putExtra("gx", gx)
+                        putExtra("gy", gy)
+                        putExtra("gz", gz)
+                    }
+                    sendBroadcast(ui)
+
+                } catch (e: Exception) {
+                    Log.e(TAG, "GYRO write failed", e)
+                }
             }
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    // ------------------------------------------------------------
-    // BACKGROUND SERVICE
-    // ------------------------------------------------------------
-    private fun startForegroundService() {
-        createNotificationChannel()
-
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Motion Logging Running")
-            .setContentText("Collecting accelerometer & gyroscope data…")
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setOngoing(true)
-            .build()
-
-        startForeground(NOTIF_ID, notification)
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Sensor Logging Service",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-        }
-    }
-
-    // ------------------------------------------------------------
-    // AUTO SYNC CSV FILE TO PHONE
-    // ------------------------------------------------------------
-    private fun sendFileToPhone(file: File) {
-
-        Wearable.getNodeClient(this)
-            .connectedNodes
+    // ----------------------------
+    // Sync files to phone
+    // ----------------------------
+    private fun sendFileToPhone(file: File, session: String) {
+        Wearable.getNodeClient(this).connectedNodes
             .addOnSuccessListener { nodes ->
-
                 if (nodes.isEmpty()) {
-                    Log.e("WearSync", "No connected phone nodes")
+                    Log.e(TAG_SYNC, "No connected phone nodes; cannot send ${file.name}")
                     return@addOnSuccessListener
                 }
 
                 val nodeId = nodes[0].id
-                Log.d("WearSync", "Sending file to node $nodeId → ${file.name}")
+                val path = "/file/$session/${file.name}"
+                Log.d(TAG_SYNC, "Sending to node=$nodeId path=$path")
 
                 Wearable.getChannelClient(this)
-                    .openChannel(nodeId, "/sync_file")
+                    .openChannel(nodeId, path)
                     .addOnSuccessListener { channel ->
-
                         Wearable.getChannelClient(this)
                             .getOutputStream(channel)
                             .addOnSuccessListener { stream ->
-
-                                stream.use { out ->
-                                    file.inputStream().use { input ->
-                                        input.copyTo(out)
+                                try {
+                                    stream.use { out ->
+                                        file.inputStream().use { input ->
+                                            input.copyTo(out)
+                                        }
                                     }
+                                    Log.d(TAG_SYNC, "Sent OK: ${file.name}")
+                                } catch (e: Exception) {
+                                    Log.e(TAG_SYNC, "Send failed: ${file.name}", e)
+                                } finally {
+                                    Wearable.getChannelClient(this).close(channel)
                                 }
-
+                            }
+                            .addOnFailureListener { e ->
+                                Log.e(TAG_SYNC, "getOutputStream failed", e)
                                 Wearable.getChannelClient(this).close(channel)
-                                Log.d("WearSync", "File sent successfully: ${file.name}")
                             }
                     }
+                    .addOnFailureListener { e ->
+                        Log.e(TAG_SYNC, "openChannel failed", e)
+                    }
+            }
+            .addOnFailureListener { e ->
+                Log.e(TAG_SYNC, "connectedNodes failed", e)
             }
     }
 
-    // ------------------------------------------------------------
-    // CLEANUP + AUTO SYNC ON STOP
-    // ------------------------------------------------------------
+    // ----------------------------
+    // Cleanup
+    // ----------------------------
     override fun onDestroy() {
         super.onDestroy()
-        Log.d("SensorService", "Service destroyed")
+        Log.d(TAG, "onDestroy() acc=${accCount.get()} gyro=${gyroCount.get()}")
 
-        sensorManager.unregisterListener(this)
+        try {
+            sensorManager.unregisterListener(this)
+        } catch (_: Exception) { }
 
-        accWriter?.close()
-        gyroWriter?.close()
+        try { accWriter?.flush(); accWriter?.close() } catch (_: Exception) { }
+        try { gyroWriter?.flush(); gyroWriter?.close() } catch (_: Exception) { }
 
-        val folder = File(filesDir, "motion_logs")
-        folder.listFiles()?.forEach { file ->
-            sendFileToPhone(file)
-        }
+        // Sync all CSVs generated in this folder
+        logsDir.listFiles()
+            ?.filter { it.isFile && it.name.endsWith(".csv", ignoreCase = true) }
+            ?.forEach { file ->
+                sendFileToPhone(file, sessionId.ifBlank { "unknown" })
+            }
+
+        stopForeground(true)
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    companion object {
+        private const val TAG = "SensorService"
+        private const val TAG_SYNC = "WearSync"
+        const val ACTION_GYRO_UPDATE = "GYRO_UPDATE"
+    }
 }
