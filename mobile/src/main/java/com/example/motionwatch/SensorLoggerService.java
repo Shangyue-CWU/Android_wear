@@ -31,7 +31,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
 
     public static final String ACTION_LOG_DONE = "com.example.motionwatch.LOG_DONE";
 
-    // ✅ NEW: live UI updates + state
+    // Live UI updates + state
     public static final String ACTION_LOG_STATE = "com.example.motionwatch.LOG_STATE";
     public static final String ACTION_LIVE_SAMPLE = "com.example.motionwatch.LIVE_SAMPLE";
 
@@ -40,12 +40,18 @@ public class SensorLoggerService extends Service implements SensorEventListener 
     private static final int NOTIF_ID = 1;
     private static final String NOTIF_CH_ID = "logger";
 
+    // ✅ Keep both sensors at the same requested rate
+    // 10,000 us = 10 ms ≈ 100 Hz
+    private static final int SAMPLING_PERIOD_US = 10_000;
+
     private SensorManager sensorManager;
     private Sensor acc, gyro;
     private BufferedWriter writer;
 
     private String label = "unlabeled";
     private String sessionId = "unknown";
+
+    // epoch_ms = bootToEpochOffsetMs + (event.timestamp / 1e6)
     private long bootToEpochOffsetMs;
 
     private long startEpochMs = 0;
@@ -57,7 +63,11 @@ public class SensorLoggerService extends Service implements SensorEventListener 
     private double accSx = 0, accSy = 0, accSz = 0;
     private double gyrSx = 0, gyrSy = 0, gyrSz = 0;
 
-    // ✅ Throttle UI broadcasts (don’t spam UI at 200Hz)
+    // Latest samples (so every row can include both ACC and GYRO)
+    private float lastAx = Float.NaN, lastAy = Float.NaN, lastAz = Float.NaN;
+    private float lastGx = Float.NaN, lastGy = Float.NaN, lastGz = Float.NaN;
+
+    // Throttle UI broadcasts (don’t spam UI at 200Hz)
     private int uiEveryN = 5;
     private int uiCounter = 0;
 
@@ -101,6 +111,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
 
             // 2) init stats + file + sensors
             resetStats();
+            resetLatestSamples();
             uiCounter = 0;
 
             try {
@@ -115,7 +126,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
             running = true;
             stopping = false;
 
-            // ✅ tell UI we started
+            // tell UI we started
             sendStateBroadcast(true);
 
             Log.d(TAG, "STARTED label=" + label + " sessionId=" + sessionId);
@@ -131,21 +142,20 @@ public class SensorLoggerService extends Service implements SensorEventListener 
         return START_NOT_STICKY;
     }
 
+    // ✅ Register both sensors at the same sampling period (microseconds)
     private void registerSensors() {
         if (sensorManager == null) return;
 
-        int delay = SensorManager.SENSOR_DELAY_GAME;
-
         if (acc != null) {
-            sensorManager.registerListener(this, acc, delay);
-            Log.d(TAG, "ACC registered");
+            sensorManager.registerListener(this, acc, SAMPLING_PERIOD_US);
+            Log.d(TAG, "ACC registered @" + SAMPLING_PERIOD_US + "us");
         } else {
             Log.e(TAG, "ACC not available");
         }
 
         if (gyro != null) {
-            sensorManager.registerListener(this, gyro, delay);
-            Log.d(TAG, "GYRO registered");
+            sensorManager.registerListener(this, gyro, SAMPLING_PERIOD_US);
+            Log.d(TAG, "GYRO registered @" + SAMPLING_PERIOD_US + "us");
         } else {
             Log.e(TAG, "GYRO not available");
         }
@@ -180,7 +190,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
         try { stopForeground(true); } catch (Exception ignored) {}
         stopSelf();
 
-        // ✅ tell UI we stopped
+        // tell UI we stopped
         sendStateBroadcast(false);
 
         // Broadcast summary for UI
@@ -217,7 +227,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
         File file = new File(logsDir, name);
 
         writer = new BufferedWriter(new FileWriter(file, false));
-        writer.write("# epoch_ms,event_ts_ns,sensor,x,y,z,label,sessionId\n");
+        writer.write("# epoch_ms,event_ts_ns,AX,AY,AZ,GX,GY,GZ,label,sessionID\n");
         writer.flush();
 
         Log.i(TAG, "Writing: " + file.getAbsolutePath());
@@ -228,32 +238,54 @@ public class SensorLoggerService extends Service implements SensorEventListener 
         if (!running || writer == null) return;
 
         long epochMs = bootToEpochOffsetMs + e.timestamp / 1_000_000L;
-        String type = (e.sensor.getType() == Sensor.TYPE_ACCELEROMETER) ? "ACC" :
-                (e.sensor.getType() == Sensor.TYPE_GYROSCOPE) ? "GYRO" : "NA";
+        long eventTsNs = e.timestamp;
 
-        float x = e.values[0], y = e.values[1], z = e.values[2];
+        int type = e.sensor.getType();
 
-        if ("ACC".equals(type)) { accSx += x; accSy += y; accSz += z; accN++; }
-        if ("GYRO".equals(type)) { gyrSx += x; gyrSy += y; gyrSz += z; gyroN++; }
+        // ✅ Update GYRO only (no row write)
+        if (type == Sensor.TYPE_GYROSCOPE) {
+            float gx = e.values[0], gy = e.values[1], gz = e.values[2];
+            lastGx = gx; lastGy = gy; lastGz = gz;
+
+            gyrSx += gx; gyrSy += gy; gyrSz += gz; gyroN++;
+            return;
+        }
+
+        // ✅ Write rows only on ACC events (merged row = nearest gyro)
+        if (type != Sensor.TYPE_ACCELEROMETER) return;
+
+        float ax = e.values[0], ay = e.values[1], az = e.values[2];
+        lastAx = ax; lastAy = ay; lastAz = az;
+
+        accSx += ax; accSy += ay; accSz += az; accN++;
 
         try {
-            writer.write(epochMs + "," + e.timestamp + "," + type + ","
-                    + x + "," + y + "," + z + "," + label + "," + sessionId + "\n");
+            writer.write(epochMs + "," + eventTsNs + ","
+                    + lastAx + "," + lastAy + "," + lastAz + ","
+                    + lastGx + "," + lastGy + "," + lastGz + ","
+                    + label + "," + sessionId + "\n");
         } catch (IOException ex) {
             Log.e(TAG, "write failed", ex);
         }
 
-        // ✅ Live UI broadcast (throttled)
+        // Live UI broadcast (throttled) — based on ACC ticks
         uiCounter++;
         if (uiCounter % uiEveryN == 0) {
             Intent live = new Intent(ACTION_LIVE_SAMPLE);
             live.setPackage(getPackageName());
             live.putExtra("sessionId", sessionId);
             live.putExtra("label", label);
-            live.putExtra("sensor", type);
-            live.putExtra("x", x);
-            live.putExtra("y", y);
-            live.putExtra("z", z);
+            live.putExtra("epochMs", epochMs);
+            live.putExtra("eventTsNs", eventTsNs);
+
+            live.putExtra("ax", lastAx);
+            live.putExtra("ay", lastAy);
+            live.putExtra("az", lastAz);
+
+            live.putExtra("gx", lastGx);
+            live.putExtra("gy", lastGy);
+            live.putExtra("gz", lastGz);
+
             sendBroadcast(live);
         }
     }
@@ -280,6 +312,11 @@ public class SensorLoggerService extends Service implements SensorEventListener 
         accN = gyroN = 0;
         accSx = accSy = accSz = 0;
         gyrSx = gyrSy = gyrSz = 0;
+    }
+
+    private void resetLatestSamples() {
+        lastAx = lastAy = lastAz = Float.NaN;
+        lastGx = lastGy = lastGz = Float.NaN;
     }
 
     private Notification buildNotification(String text) {

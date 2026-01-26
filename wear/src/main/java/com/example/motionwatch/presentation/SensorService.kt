@@ -19,6 +19,10 @@ import com.google.android.gms.wearable.Wearable
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 
@@ -28,8 +32,8 @@ class SensorService : Service(), SensorEventListener {
     private var accSensor: Sensor? = null
     private var gyroSensor: Sensor? = null
 
-    private var accWriter: BufferedWriter? = null
-    private var gyroWriter: BufferedWriter? = null
+    // ✅ single merged writer
+    private var writer: BufferedWriter? = null
 
     private val channelId = "sensor_logging_channel"
     private val notifId = 101
@@ -43,10 +47,12 @@ class SensorService : Service(), SensorEventListener {
     // log folder
     private lateinit var logsDir: File
 
+    // ✅ track the current file so we ONLY sync this run
+    private var currentLogFile: File? = null
+
     // flush every N samples to reduce data loss
     private val flushEvery = 50
-    private var accLinesSinceFlush = 0
-    private var gyroLinesSinceFlush = 0
+    private var linesSinceFlush = 0
 
     // simple counters for debugging
     private val accCount = AtomicLong(0)
@@ -55,6 +61,28 @@ class SensorService : Service(), SensorEventListener {
     // ✅ IMPORTANT: safe explicit sampling period to avoid 0us (FASTEST) crash
     // 10,000 us = 10 ms ≈ 100 Hz
     private val samplingPeriodUs = 10_000
+
+    // ✅ Latest samples so each row contains both ACC and GYRO
+    private var lastAx = Float.NaN
+    private var lastAy = Float.NaN
+    private var lastAz = Float.NaN
+    private var lastGx = Float.NaN
+    private var lastGy = Float.NaN
+    private var lastGz = Float.NaN
+
+    // ✅ Filename timestamp formatter: YYYY-MM-DD_HH-MM-SS (local time)
+    private val fileTsFormatter: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss", Locale.US)
+
+    private fun formatFileTimestamp(epochMillis: Long): String {
+        return Instant.ofEpochMilli(epochMillis)
+            .atZone(ZoneId.systemDefault())
+            .format(fileTsFormatter)
+    }
+
+    private fun sanitizeForFilename(s: String): String {
+        return s.replace(Regex("[^A-Za-z0-9_-]"), "_")
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -80,16 +108,20 @@ class SensorService : Service(), SensorEventListener {
         sessionId = intent?.getStringExtra("sessionId")
             ?: UUID.randomUUID().toString().replace("-", "").take(12)
 
-//        sessionId = UUID.randomUUID().toString().replace("-", "").take(12)
-
         // 1) START FOREGROUND IMMEDIATELY (critical on Wear/Android 12+)
         startInForeground(sportCategory, sessionId)
 
+        // reset latest samples
+        resetLatestSamples()
+        linesSinceFlush = 0
+        accCount.set(0)
+        gyroCount.set(0)
+
         // 2) Now do file I/O
         try {
-            initializeWriters(sportCategory, sessionId)
+            initializeWriter(sportCategory, sessionId)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize writers", e)
+            Log.e(TAG, "Failed to initialize writer", e)
             stopSelf()
             return START_NOT_STICKY
         }
@@ -97,7 +129,7 @@ class SensorService : Service(), SensorEventListener {
         // 3) Now register sensors (uses safe samplingPeriodUs)
         registerSensors()
 
-        Log.d(TAG, "Logging started. sport=$sportCategory session=$sessionId")
+        Log.d(TAG, "Logging started. sport=$sportCategory session=$sessionId file=${currentLogFile?.name}")
         return START_STICKY
     }
 
@@ -132,32 +164,31 @@ class SensorService : Service(), SensorEventListener {
     }
 
     // ----------------------------
-    // CSV writers
+    // CSV writer (merged file)
     // ----------------------------
-    private fun initializeWriters(label: String, session: String) {
-        val ts = System.currentTimeMillis()
-        val safeLabel = label.replace(Regex("[^A-Za-z0-9_-]"), "_")
+    private fun initializeWriter(label: String, session: String) {
+        val startMs = System.currentTimeMillis()
 
-        val accFile = File(logsDir, "SESSION_${session}_WATCH_${safeLabel}_ACC_${ts}.csv")
-        val gyroFile = File(logsDir, "SESSION_${session}_WATCH_${safeLabel}_GYRO_${ts}.csv")
+        val safeLabel = sanitizeForFilename(label)
+        val safeSession = sanitizeForFilename(session)
+        val tsHuman = formatFileTimestamp(startMs)
 
-        accWriter = BufferedWriter(FileWriter(accFile, false)).apply {
-            write("# epoch_ms,ax,ay,az,label,session\n")
+        // ✅ One merged file
+        val logFile = File(logsDir, "SESSION_${safeSession}_WATCH_${safeLabel}_${tsHuman}.csv")
+        currentLogFile = logFile
+
+        writer = BufferedWriter(FileWriter(logFile, false)).apply {
+            write("# epoch_ms,event_ts_ns,AX,AY,AZ,GX,GY,GZ,label,sessionID\n")
             flush()
         }
-        gyroWriter = BufferedWriter(FileWriter(gyroFile, false)).apply {
-            write("# epoch_ms,gx,gy,gz,label,session\n")
-            flush()
-        }
 
-        Log.d(TAG, "Created files: ${accFile.name}, ${gyroFile.name}")
+        Log.d(TAG, "Created file: ${logFile.name}")
     }
 
     // ----------------------------
     // Sensor registration
     // ----------------------------
     private fun registerSensors() {
-        // ✅ Avoid SENSOR_DELAY_FASTEST to prevent "0 microseconds" permission crash
         Log.d(TAG, "Registering sensors @ ${samplingPeriodUs}us (~${1000000.0 / samplingPeriodUs} Hz)")
 
         if (accSensor == null) {
@@ -176,61 +207,71 @@ class SensorService : Service(), SensorEventListener {
     }
 
     // ----------------------------
-    // Sensor callback
+    // Sensor callback (merged rows)
     // ----------------------------
     override fun onSensorChanged(event: SensorEvent) {
-        val t = System.currentTimeMillis()
+        val w = writer ?: return
+
+        val epochMs = System.currentTimeMillis()
+        val eventTsNs = event.timestamp
 
         when (event.sensor.type) {
             Sensor.TYPE_ACCELEROMETER -> {
-                val w = accWriter ?: return
-                try {
-                    w.write("$t,${event.values[0]},${event.values[1]},${event.values[2]},$sportCategory,$sessionId\n")
-                    accLinesSinceFlush++
-                    accCount.incrementAndGet()
-                    if (accLinesSinceFlush >= flushEvery) {
-                        w.flush()
-                        accLinesSinceFlush = 0
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "ACC write failed", e)
-                }
+                lastAx = event.values[0]
+                lastAy = event.values[1]
+                lastAz = event.values[2]
+                accCount.incrementAndGet()
             }
 
             Sensor.TYPE_GYROSCOPE -> {
-                val w = gyroWriter ?: return
-                try {
-                    val gx = event.values[0]
-                    val gy = event.values[1]
-                    val gz = event.values[2]
+                lastGx = event.values[0]
+                lastGy = event.values[1]
+                lastGz = event.values[2]
+                gyroCount.incrementAndGet()
 
-                    w.write("$t,$gx,$gy,$gz,$sportCategory,$sessionId\n")
-                    gyroLinesSinceFlush++
-                    gyroCount.incrementAndGet()
-                    if (gyroLinesSinceFlush >= flushEvery) {
-                        w.flush()
-                        gyroLinesSinceFlush = 0
-                    }
-
-                    // Live UI update (MainActivity listens for this)
-                    val ui = Intent(ACTION_GYRO_UPDATE).apply {
-                        putExtra("gx", gx)
-                        putExtra("gy", gy)
-                        putExtra("gz", gz)
-                    }
-                    sendBroadcast(ui)
-
-                } catch (e: Exception) {
-                    Log.e(TAG, "GYRO write failed", e)
+                // If you still want a gyro-only UI preview, keep broadcasting it
+                val ui = Intent(ACTION_GYRO_UPDATE).apply {
+                    putExtra("gx", lastGx)
+                    putExtra("gy", lastGy)
+                    putExtra("gz", lastGz)
                 }
+                sendBroadcast(ui)
             }
+
+            else -> return
+        }
+
+        // Write merged row on every ACC or GYRO event
+        try {
+            w.write(
+                "$epochMs,$eventTsNs," +
+                        "$lastAx,$lastAy,$lastAz," +
+                        "$lastGx,$lastGy,$lastGz," +
+                        "$sportCategory,$sessionId\n"
+            )
+            linesSinceFlush++
+            if (linesSinceFlush >= flushEvery) {
+                w.flush()
+                linesSinceFlush = 0
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Write failed", e)
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
+    private fun resetLatestSamples() {
+        lastAx = Float.NaN
+        lastAy = Float.NaN
+        lastAz = Float.NaN
+        lastGx = Float.NaN
+        lastGy = Float.NaN
+        lastGz = Float.NaN
+    }
+
     // ----------------------------
-    // Sync files to phone
+    // Sync file to phone
     // ----------------------------
     private fun sendFileToPhone(file: File, session: String) {
         Wearable.getNodeClient(this).connectedNodes
@@ -257,6 +298,11 @@ class SensorService : Service(), SensorEventListener {
                                         }
                                     }
                                     Log.d(TAG_SYNC, "Sent OK: ${file.name}")
+
+                                    // ✅ Recommended: delete after successful send to prevent re-sync forever
+                                    val deleted = try { file.delete() } catch (_: Exception) { false }
+                                    Log.d(TAG_SYNC, "Delete after send: ${file.name} -> $deleted")
+
                                 } catch (e: Exception) {
                                     Log.e(TAG_SYNC, "Send failed: ${file.name}", e)
                                 } finally {
@@ -282,21 +328,19 @@ class SensorService : Service(), SensorEventListener {
     // ----------------------------
     override fun onDestroy() {
         super.onDestroy()
-        Log.d(TAG, "onDestroy() acc=${accCount.get()} gyro=${gyroCount.get()}")
+        Log.d(TAG, "onDestroy() acc=${accCount.get()} gyro=${gyroCount.get()} file=${currentLogFile?.name}")
 
-        try {
-            sensorManager.unregisterListener(this)
-        } catch (_: Exception) { }
+        try { sensorManager.unregisterListener(this) } catch (_: Exception) { }
 
-        try { accWriter?.flush(); accWriter?.close() } catch (_: Exception) { }
-        try { gyroWriter?.flush(); gyroWriter?.close() } catch (_: Exception) { }
+        try { writer?.flush(); writer?.close() } catch (_: Exception) { }
+        writer = null
 
-        // Sync all CSVs generated in this folder
-        logsDir.listFiles()
-            ?.filter { it.isFile && it.name.endsWith(".csv", ignoreCase = true) }
-            ?.forEach { file ->
+        // ✅ Only sync this run's file (NOT the whole folder)
+        currentLogFile?.let { file ->
+            if (file.exists() && file.isFile) {
                 sendFileToPhone(file, sessionId.ifBlank { "unknown" })
             }
+        }
 
         stopForeground(true)
     }

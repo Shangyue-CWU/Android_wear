@@ -14,6 +14,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.fragment.app.Fragment
+import java.util.Locale
 
 class CollectFragment : Fragment(R.layout.fragment_collect) {
 
@@ -74,7 +75,9 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
                     val sessionId = intent.getStringExtra("sessionId") ?: "unknown"
 
                     currentSessionId = sessionId
-                    currentLabel = label.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                    currentLabel = label.replaceFirstChar {
+                        if (it.isLowerCase()) it.titlecase() else it.toString()
+                    }
                     updateLabelButton()
 
                     if (started) {
@@ -86,6 +89,10 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
                         resetStats()
                         startElapsedMs = SystemClock.elapsedRealtime()
                         tvSummary.text = "Summary: logging…"
+
+                        // Optional: clear previous displayed numbers to avoid confusion
+                        setAccText(Float.NaN, Float.NaN, Float.NaN)
+                        setGyroText(Float.NaN, Float.NaN, Float.NaN)
                     } else {
                         // Stopped state (LOG_DONE will usually follow with summary)
                         isLogging = false
@@ -95,33 +102,41 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
                 }
 
                 SensorLoggerService.ACTION_LIVE_SAMPLE -> {
-                    if (!isLogging) return
+                    // ✅ Do NOT require isLogging here; if UI missed LOG_STATE, still show live data.
+                    // But optionally require that this sample belongs to current session when we know it.
+                    val sampleSessionId = intent.getStringExtra("sessionId") ?: "unknown"
+                    if (currentSessionId != "unknown" && sampleSessionId != currentSessionId) {
+                        // ignore stale/other-session samples
+                        return
+                    }
 
-                    val sensor = intent.getStringExtra("sensor") ?: return
-                    val x = intent.getFloatExtra("x", 0f)
-                    val y = intent.getFloatExtra("y", 0f)
-                    val z = intent.getFloatExtra("z", 0f)
+                    // ✅ NEW merged payload: ax/ay/az + gx/gy/gz
+                    val ax = intent.getFloatExtra("ax", Float.NaN)
+                    val ay = intent.getFloatExtra("ay", Float.NaN)
+                    val az = intent.getFloatExtra("az", Float.NaN)
 
-                    if (sensor == "ACC") {
-                        tvAccX.text = String.format("X: %.3f m/s²", x)
-                        tvAccY.text = String.format("Y: %.3f m/s²", y)
-                        tvAccZ.text = String.format("Z: %.3f m/s²", z)
+                    val gx = intent.getFloatExtra("gx", Float.NaN)
+                    val gy = intent.getFloatExtra("gy", Float.NaN)
+                    val gz = intent.getFloatExtra("gz", Float.NaN)
 
-                        accSumX += x; accSumY += y; accSumZ += z
+                    // Update UI
+                    setAccText(ax, ay, az)
+                    setGyroText(gx, gy, gz)
+
+                    // Update local stats (optional UI feedback)
+                    if (!ax.isNaN() && !ay.isNaN() && !az.isNaN()) {
+                        accSumX += ax; accSumY += ay; accSumZ += az
                         accCount++
-                    } else if (sensor == "GYRO") {
-                        tvGyroX.text = String.format("X: %.3f rad/s", x)
-                        tvGyroY.text = String.format("Y: %.3f rad/s", y)
-                        tvGyroZ.text = String.format("Z: %.3f rad/s", z)
-
-                        gyroSumX += x; gyroSumY += y; gyroSumZ += z
+                    }
+                    if (!gx.isNaN() && !gy.isNaN() && !gz.isNaN()) {
+                        gyroSumX += gx; gyroSumY += gy; gyroSumZ += gz
                         gyroCount++
                     }
                 }
 
                 SensorLoggerService.ACTION_LOG_DONE -> {
                     val durationMs = intent.getLongExtra("durationMs", 0L)
-                    val durationStr = String.format("%.2f s", durationMs / 1000.0)
+                    val durationStr = String.format(Locale.US, "%.2f s", durationMs / 1000.0)
 
                     val accAvgX = intent.getDoubleExtra("accAvgX", 0.0)
                     val accAvgY = intent.getDoubleExtra("accAvgY", 0.0)
@@ -134,8 +149,8 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
                     tvSummary.text =
                         "Summary\n" +
                                 "Duration: $durationStr\n" +
-                                "ACC avg (X,Y,Z)= (%.3f, %.3f, %.3f) m/s²\n".format(accAvgX, accAvgY, accAvgZ) +
-                                "GYRO avg (X,Y,Z)= (%.3f, %.3f, %.3f) rad/s".format(gyrAvgX, gyrAvgY, gyrAvgZ)
+                                "ACC avg (X,Y,Z)= (%.3f, %.3f, %.3f) m/s²\n".format(Locale.US, accAvgX, accAvgY, accAvgZ) +
+                                "GYRO avg (X,Y,Z)= (%.3f, %.3f, %.3f) rad/s".format(Locale.US, gyrAvgX, gyrAvgY, gyrAvgZ)
 
                     isLogging = false
                     btnToggle.text = "Start"
@@ -165,6 +180,10 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
         tvStatus.text = "Stopped"
         tvSummary.text = "Summary: (not started)"
 
+        // Initialize display as "-"
+        setAccText(Float.NaN, Float.NaN, Float.NaN)
+        setGyroText(Float.NaN, Float.NaN, Float.NaN)
+
         btnLabel.setOnClickListener {
             if (isLogging) {
                 Toast.makeText(requireContext(), "Stop logging to change label.", Toast.LENGTH_SHORT).show()
@@ -175,7 +194,6 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
             updateLabelButton()
         }
 
-        // Phone button starts/stops phone logging (still supported)
         btnToggle.setOnClickListener {
             if (!isLogging) startLoggingFromPhoneTap()
             else stopLoggingFromPhoneTap()
@@ -193,6 +211,7 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
         if (Build.VERSION.SDK_INT >= 33) {
             requireContext().registerReceiver(logReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
+            @Suppress("DEPRECATION")
             requireContext().registerReceiver(logReceiver, filter)
         }
     }
@@ -217,6 +236,22 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
         gyroSumZ = 0.0
     }
 
+    private fun setAccText(x: Float, y: Float, z: Float) {
+        tvAccX.text = "X: ${fmt(x)} m/s²"
+        tvAccY.text = "Y: ${fmt(y)} m/s²"
+        tvAccZ.text = "Z: ${fmt(z)} m/s²"
+    }
+
+    private fun setGyroText(x: Float, y: Float, z: Float) {
+        tvGyroX.text = "X: ${fmt(x)} rad/s"
+        tvGyroY.text = "Y: ${fmt(y)} rad/s"
+        tvGyroZ.text = "Z: ${fmt(z)} rad/s"
+    }
+
+    private fun fmt(v: Float): String {
+        return if (v.isNaN()) "-" else String.format(Locale.US, "%.3f", v)
+    }
+
     // ----------------------------
     // Phone tap: start service
     // ----------------------------
@@ -237,7 +272,6 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
             Toast.makeText(requireContext(), "Error starting service: ${e.message}", Toast.LENGTH_LONG).show()
             return
         }
-
         // UI will update via ACTION_LOG_STATE broadcast from service
     }
 
@@ -246,7 +280,6 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
             action = SensorLoggerService.ACTION_STOP
         }
         requireContext().startService(stop)
-
         // UI will update via ACTION_LOG_STATE + ACTION_LOG_DONE
     }
 }
