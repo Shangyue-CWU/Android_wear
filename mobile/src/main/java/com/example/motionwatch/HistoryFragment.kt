@@ -43,7 +43,7 @@ class HistoryFragment : Fragment(R.layout.fragment_history) {
         listView = view.findViewById(R.id.list_logs)
         tvHint = view.findViewById(R.id.tv_hint)
 
-        // ✅ Use custom row layout with padding + multi-line text
+        // Use custom row layout with padding + multi-line text
         adapter = android.widget.ArrayAdapter(
             requireContext(),
             R.layout.item_history_file,
@@ -54,7 +54,7 @@ class HistoryFragment : Fragment(R.layout.fragment_history) {
         // Avoid odd focus/selection behavior on some devices
         listView.setItemsCanFocus(false)
 
-        // ✅ Enable contextual multi-selection mode
+        // Enable contextual multi-selection mode
         listView.choiceMode = ListView.CHOICE_MODE_MULTIPLE_MODAL
         listView.setMultiChoiceModeListener(historyMultiChoiceListener)
 

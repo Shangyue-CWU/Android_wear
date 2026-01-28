@@ -40,7 +40,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
     private static final int NOTIF_ID = 1;
     private static final String NOTIF_CH_ID = "logger";
 
-    // ✅ Keep both sensors at the same requested rate
+    // Keep both sensors at the same requested rate
     // 10,000 us = 10 ms ≈ 100 Hz
     private static final int SAMPLING_PERIOD_US = 10_000;
 
@@ -142,7 +142,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
         return START_NOT_STICKY;
     }
 
-    // ✅ Register both sensors at the same sampling period (microseconds)
+    // Register both sensors at the same sampling period (microseconds)
     private void registerSensors() {
         if (sensorManager == null) return;
 
@@ -242,7 +242,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
 
         int type = e.sensor.getType();
 
-        // ✅ Update GYRO only (no row write)
+        // Update GYRO only (no row write)
         if (type == Sensor.TYPE_GYROSCOPE) {
             float gx = e.values[0], gy = e.values[1], gz = e.values[2];
             lastGx = gx; lastGy = gy; lastGz = gz;
@@ -251,7 +251,7 @@ public class SensorLoggerService extends Service implements SensorEventListener 
             return;
         }
 
-        // ✅ Write rows only on ACC events (merged row = nearest gyro)
+        // Write rows only on ACC events (merged row = nearest gyro)
         if (type != Sensor.TYPE_ACCELEROMETER) return;
 
         float ax = e.values[0], ay = e.values[1], az = e.values[2];

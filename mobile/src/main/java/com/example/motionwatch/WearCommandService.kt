@@ -95,7 +95,7 @@ class WearCommandService : WearableListenerService() {
         const val PATH_START = "/cmd/start"
         const val PATH_STOP  = "/cmd/stop"
 
-        // ✅ NEW: UI broadcast action (CollectFragment listens to this)
+        // NEW: UI broadcast action (CollectFragment listens to this)
         const val ACTION_UI_CMD = "com.example.motionwatch.UI_CMD"
     }
 }
