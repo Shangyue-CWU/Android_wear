@@ -60,9 +60,7 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
             }
         }
 
-    // ---------------------------------------------------------
-    // ✅ Receive updates from SensorLoggerService (watch OR phone)
-    // ---------------------------------------------------------
+    // Receive updates from SensorLoggerService (watch OR phone)
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent == null) return
@@ -102,7 +100,6 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
                 }
 
                 SensorLoggerService.ACTION_LIVE_SAMPLE -> {
-                    // ✅ Do NOT require isLogging here; if UI missed LOG_STATE, still show live data.
                     // But optionally require that this sample belongs to current session when we know it.
                     val sampleSessionId = intent.getStringExtra("sessionId") ?: "unknown"
                     if (currentSessionId != "unknown" && sampleSessionId != currentSessionId) {
@@ -110,7 +107,7 @@ class CollectFragment : Fragment(R.layout.fragment_collect) {
                         return
                     }
 
-                    // ✅ NEW merged payload: ax/ay/az + gx/gy/gz
+                    // NEW merged payload: ax/ay/az + gx/gy/gz
                     val ax = intent.getFloatExtra("ax", Float.NaN)
                     val ay = intent.getFloatExtra("ay", Float.NaN)
                     val az = intent.getFloatExtra("az", Float.NaN)

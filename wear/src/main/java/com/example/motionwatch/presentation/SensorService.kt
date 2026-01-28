@@ -32,7 +32,7 @@ class SensorService : Service(), SensorEventListener {
     private var accSensor: Sensor? = null
     private var gyroSensor: Sensor? = null
 
-    // ✅ single merged writer
+    // single merged writer
     private var writer: BufferedWriter? = null
 
     private val channelId = "sensor_logging_channel"
@@ -47,7 +47,7 @@ class SensorService : Service(), SensorEventListener {
     // log folder
     private lateinit var logsDir: File
 
-    // ✅ track the current file so we ONLY sync this run
+    // track the current file so we ONLY sync this run
     private var currentLogFile: File? = null
 
     // flush every N samples to reduce data loss
@@ -58,11 +58,11 @@ class SensorService : Service(), SensorEventListener {
     private val accCount = AtomicLong(0)
     private val gyroCount = AtomicLong(0)
 
-    // ✅ IMPORTANT: safe explicit sampling period to avoid 0us (FASTEST) crash
+    // IMPORTANT: safe explicit sampling period to avoid 0us (FASTEST) crash
     // 10,000 us = 10 ms ≈ 100 Hz
     private val samplingPeriodUs = 10_000
 
-    // ✅ Latest samples so each row contains both ACC and GYRO
+    // Latest samples so each row contains both ACC and GYRO
     private var lastAx = Float.NaN
     private var lastAy = Float.NaN
     private var lastAz = Float.NaN
@@ -70,7 +70,7 @@ class SensorService : Service(), SensorEventListener {
     private var lastGy = Float.NaN
     private var lastGz = Float.NaN
 
-    // ✅ Filename timestamp formatter: YYYY-MM-DD_HH-MM-SS (local time)
+    // Filename timestamp formatter: YYYY-MM-DD_HH-MM-SS (local time)
     private val fileTsFormatter: DateTimeFormatter =
         DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss", Locale.US)
 
@@ -173,7 +173,7 @@ class SensorService : Service(), SensorEventListener {
         val safeSession = sanitizeForFilename(session)
         val tsHuman = formatFileTimestamp(startMs)
 
-        // ✅ One merged file
+        //One merged file
         val logFile = File(logsDir, "SESSION_${safeSession}_WATCH_${safeLabel}_${tsHuman}.csv")
         currentLogFile = logFile
 
@@ -299,7 +299,7 @@ class SensorService : Service(), SensorEventListener {
                                     }
                                     Log.d(TAG_SYNC, "Sent OK: ${file.name}")
 
-                                    // ✅ Recommended: delete after successful send to prevent re-sync forever
+                                    //  Recommended: delete after successful send to prevent re-sync forever
                                     val deleted = try { file.delete() } catch (_: Exception) { false }
                                     Log.d(TAG_SYNC, "Delete after send: ${file.name} -> $deleted")
 
@@ -335,7 +335,7 @@ class SensorService : Service(), SensorEventListener {
         try { writer?.flush(); writer?.close() } catch (_: Exception) { }
         writer = null
 
-        // ✅ Only sync this run's file (NOT the whole folder)
+        // Only sync this run's file (NOT the whole folder)
         currentLogFile?.let { file ->
             if (file.exists() && file.isFile) {
                 sendFileToPhone(file, sessionId.ifBlank { "unknown" })
