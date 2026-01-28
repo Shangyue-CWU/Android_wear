@@ -2,17 +2,30 @@
 <manifest xmlns:tools="http://schemas.android.com/tools"
     xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <!-- Keep CPU awake during logging (optional but useful) -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-    <uses-feature android:name="android.hardware.type.watch" />
+    <!-- Foreground Service permission -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.BODY_SENSORS" />
 
-    <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
-    <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+    <!-- Android 13+ requires this for foreground notifications on many devices -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- You do NOT need BODY_SENSORS for accelerometer/gyroscope -->
+    <!-- <uses-permission android:name="android.permission.BODY_SENSORS" /> -->
 
+    <!-- Optional: only required if you use SENSOR_DELAY_FASTEST (0us) again -->
+    <!-- <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" /> -->
 
+    <uses-feature
+        android:name="android.hardware.sensor.accelerometer"
+        android:required="false" />
+
+    <uses-feature
+        android:name="android.hardware.sensor.gyroscope"
+        android:required="false" />
 
     <application
         android:allowBackup="true"
@@ -21,14 +34,11 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault"
         tools:ignore="ForegroundServicePermission">
+
         <uses-library
             android:name="com.google.android.wearable"
             android:required="true" />
 
-        <!--
-               Set to true if your app is Standalone, that is, it does not require the handheld
-               app to run.
-        -->
         <meta-data
             android:name="com.google.android.wearable.standalone"
             android:value="true" />
@@ -40,14 +50,14 @@
             android:theme="@style/MainActivityTheme.Starting">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Foreground logging service -->
         <service
             android:name=".presentation.SensorService"
-            android:exported="false"
-            android:foregroundServiceType="health" />
+            android:exported="false" />
     </application>
 
 </manifest>
